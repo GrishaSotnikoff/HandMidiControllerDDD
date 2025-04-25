@@ -1,66 +1,43 @@
-﻿using System;
-using MediatR;
-using Microsoft.Extensions.DependencyInjection;
-using HandMidiControllerDDD.Application.Commands;
-using HandMidiControllerDDD.Application.Interfaces;
-using HandMidiControllerDDD.Domain.Services;
-using HandMidiControllerDDD.Infrastructure;
-using Microsoft.Extensions.Logging;
+﻿// Program.cs
+using System;
 using System.Threading;
-using Sanford.Multimedia.Midi;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using HandMidiControllerDDD.Application.Interfaces;
+using HandMidiControllerDDD.Infrastructure;
 
 var services = new ServiceCollection();
+
+// 1) Console logging
 services.AddLogging(cfg =>
 {
     cfg.AddConsole();
-    cfg.SetMinimumLevel(LogLevel.Information);
+    cfg.SetMinimumLevel(LogLevel.Debug);
 });
-services.AddMediatR(typeof(TrackHandPositionCommand));
-services.AddSingleton<IHandTrackingService, HandTrackingService>();
-services.AddSingleton<ICameraService, CameraService>();
-services.AddSingleton<IMidiService, MidiService>();
 
+// 2) Hook up your services
+services.AddSingleton<IMidiService, MidiService>();
+services.AddSingleton<ICameraService, CameraService>();
 
 var provider = services.BuildServiceProvider();
-var logger = provider.GetRequiredService<ILogger<Program>>();
-var mediator = provider.GetRequiredService<IMediator>();
-var camera = provider.GetRequiredService<ICameraService>();
-var tracker = provider.GetRequiredService<IHandTrackingService>();
-var handTracker = provider.GetRequiredService<IHandTrackingService>();
+var loggerFactory = provider.GetRequiredService<ILoggerFactory>();
+var logger = loggerFactory.CreateLogger("Program");
 
-Console.WriteLine("Starting Hand MIDI Controller with DDD...");
-int deviceCount = OutputDevice.DeviceCount;
-Console.WriteLine($"🎛 Found {deviceCount} MIDI Output Devices:\n");
+logger.LogInformation("🚀 Booting HandMidiControllerDDD...");
 
-for (int i = 0; i < deviceCount; i++)
+// 3) Resolve ICameraService to kick off the WebSocket + MIDI loops
+var cameraService = provider.GetRequiredService<ICameraService>();
+
+// 4) Keep the app alive until Ctrl+C
+logger.LogInformation("Press Ctrl+C to exit.");
+var exitEvent = new ManualResetEvent(false);
+Console.CancelKeyPress += (s, e) =>
 {
-    try
-    {
-        var caps = OutputDevice.GetDeviceCapabilities(i);
+    e.Cancel = true;
+    exitEvent.Set();
+};
+exitEvent.WaitOne();
 
-        Console.WriteLine($"[{i}] {caps.name}");
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"[{i}] Error getting device info: {ex.Message}");
-    }
-}
-while (true)
-{
-    try
-    {
-        // grab raw position
-        var pos = camera.GetHandPosition();
-
-        // domain logic
-        var gesture = tracker.TrackHand(pos.X, pos.Y, pos.Z);
-
-        // fire off MIDI
-        mediator.Send(new TrackHandPositionCommand(pos));
-
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "🔥 Oops, something broke in the main loop");
-    }
-}
+// 5) Clean shutdown
+logger.LogInformation("👋 Shutting down services...");
+cameraService.Dispose();

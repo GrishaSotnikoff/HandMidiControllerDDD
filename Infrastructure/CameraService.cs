@@ -12,104 +12,95 @@ namespace HandMidiControllerDDD.Infrastructure
 {
     public class CameraService : ICameraService, IDisposable
     {
-        private readonly ClientWebSocket _ws;
         private readonly ILogger<CameraService> _logger;
         private readonly IMidiService _midi;
         private readonly CancellationTokenSource _cts = new();
-        private double _x, _y, _z;
+        private double _lastX, _lastY, _lastZ;
+
+        // Gesture-to-CC mapping: (ccX, ccY)
+        private static readonly System.Collections.Generic.Dictionary<string, (int ccX, int ccY)> _mapping =
+            new()
+            {
+                ["fist"] = (21, 22),
+                ["open"] = (23, 24),
+                ["point"] = (71, 72),
+                ["victory"] = (73, 74),
+                ["rock"] = (91, 92),
+            };
 
         public CameraService(ILogger<CameraService> logger, IMidiService midi)
         {
             _logger = logger;
             _midi = midi;
-            _ws = new ClientWebSocket();
-            _ = ConnectAndReceiveLoopAsync(_cts.Token);
+            _ = RunLoopAsync(_cts.Token);
         }
 
-        private async Task ConnectAndReceiveLoopAsync(CancellationToken token)
+        private async Task RunLoopAsync(CancellationToken token)
         {
-            try
+            var buffer = new byte[512];
+            while (!token.IsCancellationRequested)
             {
-                await _ws.ConnectAsync(new Uri("ws://localhost:8765"), token);
-                _logger.LogInformation("✨ Connected to Python hand server.");
-
-                var buffer = new byte[4096];
-                while (_ws.State == WebSocketState.Open && !token.IsCancellationRequested)
+                using var ws = new ClientWebSocket();
+                try
                 {
-                    var seg = new ArraySegment<byte>(buffer);
-                    var result = await _ws.ReceiveAsync(seg, token);
+                    await ws.ConnectAsync(new Uri("ws://localhost:8765"), token);
+                    _logger.LogInformation("Connected to gesture server.");
 
-                    if (result.MessageType == WebSocketMessageType.Close)
+                    while (ws.State == WebSocketState.Open && !token.IsCancellationRequested)
                     {
-                        _logger.LogInformation("Server closed connection.");
-                        break;
-                    }
-                    else if (result.MessageType == WebSocketMessageType.Text)
-                    {
+                        var result = await ws.ReceiveAsync(buffer, token);
+                        if (result.MessageType == WebSocketMessageType.Close)
+                            break;
+
                         var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                        try
-                        {
-                            var frame = JsonSerializer.Deserialize<Frame>(json)!;
+                        var frame = JsonSerializer.Deserialize<GestureFrame>(json);
 
-                            if (frame.detected && frame.fingers != null)
+                        if (frame.Detected == true)
+                        {
+                            _lastX = frame.x;
+                            _lastY = frame.y;
+                            _lastZ = 0;
+                            if (_mapping.TryGetValue(frame.Gesture, out var pair))
                             {
-                                for (int i = 0; i < frame.fingers.Length; i++)
-                                {
-                                    var finger = frame.fingers[i];
-                                    int ccValue = ClampMidi(1.0 - finger.y); // invert Y: hand higher = higher CC
-                                    int ccNumber = 22 + i; // Thumb starts at CC21
-
-                                    _midi.SendControlChange(ccNumber, ccValue);
-                                    _logger.LogInformation("🎛️ Finger {0} → CC#{1} → {2}", i, ccNumber, ccValue);
-                                }
+                                SendGestureMidi(pair.ccX, pair.ccY, frame.x, frame.y, frame.Gesture);
                             }
-                        }
-                        catch (JsonException ex)
-                        {
-                            _logger.LogError(ex, "Invalid JSON from hand_server: {Json}", json);
+                            else
+                            {
+                                _logger.LogDebug("Skipping unknown gesture '{Gesture}'", frame.Gesture);
+                            }
                         }
                     }
                 }
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "WebSocket error, retrying...");
+                }
+                // wait before reconnect
+                try { await Task.Delay(3000, token); } catch { break; }
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "WebSocket connect/receive error");
-            }
         }
 
-        private class Frame
+        private void SendGestureMidi(int ccX, int ccY, double x, double y, string gesture)
         {
-            public FingerCoord[] fingers { get; set; }
-            public bool detected { get; set; }
+            int vX = Clamp(x), vY = Clamp(y);
+            _midi.SendControlChange(ccX, vX);
+            _midi.SendControlChange(ccY, vY);
+            _logger.LogInformation("Gesture '{Gesture}': CC#{CcX}={ValX}, CC#{CcY}={ValY}", gesture, ccX, vX, ccY, vY);
         }
 
-        private class FingerCoord
-        {
-            public double x { get; set; }
-            public double y { get; set; }
-            public double z { get; set; }
-        }
+        private static int Clamp(double v) => Math.Clamp((int)(v * 127), 0, 127);
 
-        private int ClampMidi(double val) =>
-            Math.Clamp((int)(val * 127), 0, 127);
-
-        public HandPosition GetHandPosition() => new(_x, _y, _z);
+        public HandPosition GetHandPosition() => new(_lastX, _lastY, _lastZ);
 
         public void Dispose()
         {
             _cts.Cancel();
-            if (_ws.State == WebSocketState.Open)
-                _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "disposing", CancellationToken.None).Wait();
-            _ws.Dispose();
             _logger.LogInformation("CameraService disposed.");
         }
 
-        private class Coord
-        {
-            public double X { get; set; }
-            public double Y { get; set; }
-            public double Z { get; set; }
-            public bool detected { get; set; }
-        }
+        private class GestureFrame {
+  
+            public bool Detected { get; set; } public string Gesture { get; set; } public double x { get; set; } public double y { get; set; } }
     }
 }
