@@ -7,18 +7,22 @@ using System.Threading.Tasks;
 using HandMidiControllerDDD.Application.Interfaces;
 using HandMidiControllerDDD.Domain.ValueObjects;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Prometheus;
 
 namespace HandMidiControllerDDD.Infrastructure
 {
     public class CameraService : ICameraService, IDisposable
     {
+        private readonly string _wsAddress;
         private readonly ILogger<CameraService> _logger;
         private readonly IMidiService _midi;
+        private readonly MetricPusher _pusher;
+        private readonly Counter _eventCounter;
         private readonly CancellationTokenSource _cts = new();
 
-        // Last hand position and gesture
+        // Last hand position
         private double _lastX, _lastY, _lastZ;
-        private string _prevGesture = string.Empty;
 
         // Gesture-to-CC mapping
         private static readonly System.Collections.Generic.Dictionary<string, (int Xcc, int Ycc)> _ccMap = new()
@@ -30,10 +34,25 @@ namespace HandMidiControllerDDD.Infrastructure
             ["rock"] = (91, 92),
         };
 
-        public CameraService(ILogger<CameraService> logger, IMidiService midi)
+        public CameraService(
+            ILogger<CameraService> logger,
+            IMidiService midi,
+            IOptions<WebSocketOptions> wsOpts,
+            MetricPusher pusher)
         {
             _logger = logger;
             _midi = midi;
+            _wsAddress = wsOpts.Value.Address;
+            _pusher = pusher;
+
+            // Create and register our Prometheus counter
+            _eventCounter = Metrics
+                .CreateCounter("hand_event_total", "Total number of hand-tracking events");
+
+            // Start the Pushgateway client loop (will post at its configured interval)
+            _pusher.Start();  // ← use Start(), not Push() :contentReference[oaicite:0]{index=0}
+
+            // Fire-and-forget our WS receive loop
             _ = RunLoopAsync(_cts.Token);
         }
 
@@ -46,8 +65,8 @@ namespace HandMidiControllerDDD.Infrastructure
                 using var ws = new ClientWebSocket();
                 try
                 {
-                    await ws.ConnectAsync(new Uri("ws://localhost:8765"), token);
-                    _logger.LogInformation("Connected to gesture server.");
+                    await ws.ConnectAsync(new Uri(_wsAddress), token);
+                    _logger.LogInformation("Connected to gesture WS at {Url}", _wsAddress);
 
                     while (ws.State == WebSocketState.Open && !token.IsCancellationRequested)
                     {
@@ -56,66 +75,45 @@ namespace HandMidiControllerDDD.Infrastructure
 
                         var json = Encoding.UTF8.GetString(buffer, 0, res.Count);
                         var frame = JsonSerializer.Deserialize<GestureFrame>(json);
-                        if (frame.Detected == true)
+                        if (frame?.Detected == true)
                         {
                             _lastX = frame.x;
                             _lastY = frame.y;
-                            _lastZ = frame.z; // if server sends Z, else 0
+                            _lastZ = frame.z;
 
-                            // On gesture change, trigger note
-                            //if (frame.Gesture != _prevGesture)
-                            //{
-                            //    TriggerGestureNote(frame.Gesture, _lastX, _lastY, _lastZ);
-                            //    _prevGesture = frame.Gesture;
-                            //}
-
-                            // Always send CCs for current gesture
                             if (_ccMap.TryGetValue(frame.Gesture, out var cc))
                             {
                                 int vX = Clamp(_lastX);
                                 int vY = Clamp(_lastY);
+
                                 _midi.SendControlChange(cc.Xcc, vX);
                                 _midi.SendControlChange(cc.Ycc, vY);
-                                _logger.LogDebug("{Gesture}: CC#{Xcc}={ValX}, CC#{Ycc}={ValY}", frame.Gesture, cc.Xcc, vX, cc.Ycc, vY);
+
+                                _logger.LogDebug(
+                                  "{Gesture}: CC#{Xcc}={ValX}, CC#{Ycc}={ValY}",
+                                  frame.Gesture, cc.Xcc, vX, cc.Ycc, vY);
                             }
+
+                            // bump the Prom counter (Pushgateway client will pick it up)
+                            _eventCounter.Inc();
                         }
                     }
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "WebSocket error, retrying...");
+                    _logger.LogError(ex, "WS error, retrying in 3s…");
                 }
 
-                // delay before reconnect
                 try { await Task.Delay(3000, token); } catch { break; }
             }
         }
 
-        private void TriggerGestureNote(string gesture, double x, double y, double z)
-        {
-            // Map axes to note number and velocity
-            int note = MapToNote(x, y, z);
-            int vel = Clamp(y);
+        public HandPosition GetHandPosition() =>
+            new(_lastX, _lastY, _lastZ);
 
-            _midi.SendNoteOn(note, vel);
-            // schedule note off after 200ms
-            Task.Delay(200).ContinueWith(_ => _midi.SendNoteOff(note));
-
-            _logger.LogInformation("Gesture '{Gesture}' changed → NoteOn {Note} Vel {Vel}", gesture, note, vel);
-        }
-
-        private static int MapToNote(double x, double y, double z)
-        {
-            // combine normalized axes to a note in range C3 (48) to C6 (84)
-            double avg = (x + y + z) / 3.0;
-            int note = 48 + Clamp(avg) * 36 / 127;
-            return Math.Clamp(note, 0, 127);
-        }
-
-        private static int Clamp(double v) => Math.Clamp((int)(v * 127), 0, 127);
-
-        public HandPosition GetHandPosition() => new(_lastX, _lastY, _lastZ);
+        private static int Clamp(double v) =>
+            Math.Clamp((int)(v * 127), 0, 127);
 
         public void Dispose()
         {

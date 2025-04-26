@@ -1,0 +1,14 @@
+{
+    "WebSocketServer": {
+        "Address": "ws://localhost:8765"
+    },
+    "Prometheus": {
+        "PushGatewayUrl": "http://localhost:9090",
+        "JobName": "hand_midi_controller"
+    },
+    "Midi": {
+        "DeviceId": 0,
+        "Channel": 0
+    }
+
+}

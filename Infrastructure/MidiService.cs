@@ -1,6 +1,7 @@
 ﻿using System;
 using HandMidiControllerDDD.Application.Interfaces;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Sanford.Multimedia.Midi;
 
 namespace HandMidiControllerDDD.Infrastructure
@@ -9,12 +10,14 @@ namespace HandMidiControllerDDD.Infrastructure
     {
         private readonly OutputDevice _device;
         private readonly ILogger<MidiService> _logger;
+        private readonly MidiOptions _midiOpts;
 
-        public MidiService(ILogger<MidiService> logger, int deviceId = 1)
+        public MidiService(ILogger<MidiService> logger, IOptions<MidiOptions> midiOpts)
         {
             _logger = logger;
-            _device = new OutputDevice(deviceId);
-            _logger.LogInformation("🎛️ Connected to MIDI device #{DeviceId}", deviceId);
+            _midiOpts = midiOpts.Value;
+            _device = new OutputDevice(midiOpts.Value.DeviceId);
+            _logger.LogInformation("🎛️ Connected to MIDI device #{DeviceId}", midiOpts.Value.DeviceId);
         }
 
         public void SendControlChange(int control, int value)
@@ -23,7 +26,7 @@ namespace HandMidiControllerDDD.Infrastructure
             control = Math.Clamp(control, 0, 127);
             value = Math.Clamp(value, 0, 127);
 
-            var msg = new ChannelMessage(ChannelCommand.Controller, 0, control, value); // Channel 0 = MIDI Channel 1
+            var msg = new ChannelMessage(ChannelCommand.Controller, _midiOpts.MidiChannel, control, value); // Channel 0 = MIDI Channel 1
             _device.Send(msg);
 
         }
@@ -36,13 +39,13 @@ namespace HandMidiControllerDDD.Infrastructure
 
         public void SendNoteOn(int note, int velocity)
         {
-            var msg = new ChannelMessage(ChannelCommand.NoteOn, 0, note, velocity);
+            var msg = new ChannelMessage(ChannelCommand.NoteOn, _midiOpts.MidiChannel, note, velocity);
             _device.Send(msg);
         }
 
         public void SendNoteOff(int note)
         {
-            var msg = new ChannelMessage(ChannelCommand.NoteOff, 0, note, 0);
+            var msg = new ChannelMessage(ChannelCommand.NoteOff, _midiOpts.MidiChannel, note, 0);
             _device.Send(msg);
         }
 
