@@ -15,18 +15,20 @@ namespace HandMidiControllerDDD.Infrastructure
         private readonly ILogger<CameraService> _logger;
         private readonly IMidiService _midi;
         private readonly CancellationTokenSource _cts = new();
-        private double _lastX, _lastY, _lastZ;
 
-        // Gesture-to-CC mapping: (ccX, ccY)
-        private static readonly System.Collections.Generic.Dictionary<string, (int ccX, int ccY)> _mapping =
-            new()
-            {
-                ["fist"] = (21, 22),
-                ["open"] = (23, 24),
-                ["point"] = (71, 72),
-                ["victory"] = (73, 74),
-                ["rock"] = (91, 92),
-            };
+        // Last hand position and gesture
+        private double _lastX, _lastY, _lastZ;
+        private string _prevGesture = string.Empty;
+
+        // Gesture-to-CC mapping
+        private static readonly System.Collections.Generic.Dictionary<string, (int Xcc, int Ycc)> _ccMap = new()
+        {
+            ["fist"] = (21, 22),
+            ["open"] = (23, 83),
+            ["point"] = (93, 10),
+            ["victory"] = (73, 74),
+            ["rock"] = (91, 92),
+        };
 
         public CameraService(ILogger<CameraService> logger, IMidiService midi)
         {
@@ -38,6 +40,7 @@ namespace HandMidiControllerDDD.Infrastructure
         private async Task RunLoopAsync(CancellationToken token)
         {
             var buffer = new byte[512];
+
             while (!token.IsCancellationRequested)
             {
                 using var ws = new ClientWebSocket();
@@ -48,25 +51,32 @@ namespace HandMidiControllerDDD.Infrastructure
 
                     while (ws.State == WebSocketState.Open && !token.IsCancellationRequested)
                     {
-                        var result = await ws.ReceiveAsync(buffer, token);
-                        if (result.MessageType == WebSocketMessageType.Close)
-                            break;
+                        var res = await ws.ReceiveAsync(buffer, token);
+                        if (res.MessageType == WebSocketMessageType.Close) break;
 
-                        var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                        var json = Encoding.UTF8.GetString(buffer, 0, res.Count);
                         var frame = JsonSerializer.Deserialize<GestureFrame>(json);
-
                         if (frame.Detected == true)
                         {
                             _lastX = frame.x;
                             _lastY = frame.y;
-                            _lastZ = 0;
-                            if (_mapping.TryGetValue(frame.Gesture, out var pair))
+                            _lastZ = frame.z; // if server sends Z, else 0
+
+                            // On gesture change, trigger note
+                            //if (frame.Gesture != _prevGesture)
+                            //{
+                            //    TriggerGestureNote(frame.Gesture, _lastX, _lastY, _lastZ);
+                            //    _prevGesture = frame.Gesture;
+                            //}
+
+                            // Always send CCs for current gesture
+                            if (_ccMap.TryGetValue(frame.Gesture, out var cc))
                             {
-                                SendGestureMidi(pair.ccX, pair.ccY, frame.x, frame.y, frame.Gesture);
-                            }
-                            else
-                            {
-                                _logger.LogDebug("Skipping unknown gesture '{Gesture}'", frame.Gesture);
+                                int vX = Clamp(_lastX);
+                                int vY = Clamp(_lastY);
+                                _midi.SendControlChange(cc.Xcc, vX);
+                                _midi.SendControlChange(cc.Ycc, vY);
+                                _logger.LogDebug("{Gesture}: CC#{Xcc}={ValX}, CC#{Ycc}={ValY}", frame.Gesture, cc.Xcc, vX, cc.Ycc, vY);
                             }
                         }
                     }
@@ -76,17 +86,31 @@ namespace HandMidiControllerDDD.Infrastructure
                 {
                     _logger.LogError(ex, "WebSocket error, retrying...");
                 }
-                // wait before reconnect
+
+                // delay before reconnect
                 try { await Task.Delay(3000, token); } catch { break; }
             }
         }
 
-        private void SendGestureMidi(int ccX, int ccY, double x, double y, string gesture)
+        private void TriggerGestureNote(string gesture, double x, double y, double z)
         {
-            int vX = Clamp(x), vY = Clamp(y);
-            _midi.SendControlChange(ccX, vX);
-            _midi.SendControlChange(ccY, vY);
-            _logger.LogInformation("Gesture '{Gesture}': CC#{CcX}={ValX}, CC#{CcY}={ValY}", gesture, ccX, vX, ccY, vY);
+            // Map axes to note number and velocity
+            int note = MapToNote(x, y, z);
+            int vel = Clamp(y);
+
+            _midi.SendNoteOn(note, vel);
+            // schedule note off after 200ms
+            Task.Delay(200).ContinueWith(_ => _midi.SendNoteOff(note));
+
+            _logger.LogInformation("Gesture '{Gesture}' changed → NoteOn {Note} Vel {Vel}", gesture, note, vel);
+        }
+
+        private static int MapToNote(double x, double y, double z)
+        {
+            // combine normalized axes to a note in range C3 (48) to C6 (84)
+            double avg = (x + y + z) / 3.0;
+            int note = 48 + Clamp(avg) * 36 / 127;
+            return Math.Clamp(note, 0, 127);
         }
 
         private static int Clamp(double v) => Math.Clamp((int)(v * 127), 0, 127);
@@ -99,8 +123,13 @@ namespace HandMidiControllerDDD.Infrastructure
             _logger.LogInformation("CameraService disposed.");
         }
 
-        private class GestureFrame {
-  
-            public bool Detected { get; set; } public string Gesture { get; set; } public double x { get; set; } public double y { get; set; } }
+        private class GestureFrame
+        {
+            public bool Detected { get; set; }
+            public string Gesture { get; set; }
+            public double x { get; set; }
+            public double y { get; set; }
+            public double z { get; set; }
+        }
     }
 }
