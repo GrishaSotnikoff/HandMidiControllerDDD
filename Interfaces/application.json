@@ -9,6 +9,9 @@
     "Midi": {
         "DeviceId": 0,
         "Channel": 0
+    },
+    "RabbitMq": {
+
     }
 
 }
